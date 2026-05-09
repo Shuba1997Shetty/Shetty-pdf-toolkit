@@ -2315,7 +2315,62 @@
                 const cleaned = trimmed.replace(/^-/, '');
                 return /^[\d,]+\.?\d*$/.test(cleaned) && /\d/.test(cleaned);
             };
+            
+            // STEP 1: Auto-detect actual column right-edges from data
+            // Many bank PDFs have headers narrower than data columns - we need to find
+            // where amount values actually cluster to determine real column boundaries
+            const amountColIndices = columnInfo.map((c, i) => c.isAmount ? i : -1).filter(i => i >= 0);
+            const detectedRightEdges = {};
+            
+            if (amountColIndices.length > 0) {
+                // Collect all amount item right-edges from data
+                const allRights = [];
+                rows.forEach(row => {
+                    row.forEach(item => {
+                        if (isAmountText(item.text)) {
+                            allRights.push(item.x + (item.width || 0));
+                        }
+                    });
+                });
+                
+                // Cluster right-edges (within 15 pixels = same column)
+                if (allRights.length > 5) {
+                    allRights.sort((a, b) => a - b);
+                    const clusters = [];
+                    let currentCluster = [allRights[0]];
+                    for (let i = 1; i < allRights.length; i++) {
+                        if (allRights[i] - currentCluster[currentCluster.length - 1] < 15) {
+                            currentCluster.push(allRights[i]);
+                        } else {
+                            if (currentCluster.length >= 2) clusters.push(currentCluster);
+                            currentCluster = [allRights[i]];
+                        }
+                    }
+                    if (currentCluster.length >= 2) clusters.push(currentCluster);
+                    
+                    // Get median of each cluster as the column's actual right-edge
+                    const clusterCenters = clusters.map(c => c[Math.floor(c.length / 2)]);
+                    
+                    // Match clusters to amount columns based on proximity
+                    amountColIndices.forEach(colIdx => {
+                        const headerRight = columnInfo[colIdx].right;
+                        let bestCluster = null;
+                        let bestDist = Infinity;
+                        clusterCenters.forEach(cc => {
+                            const dist = Math.abs(cc - headerRight);
+                            if (dist < bestDist && dist < 100) {
+                                bestDist = dist;
+                                bestCluster = cc;
+                            }
+                        });
+                        if (bestCluster !== null) {
+                            detectedRightEdges[colIdx] = bestCluster;
+                        }
+                    });
+                }
+            }
 
+            // STEP 2: Match each item to the best column
             rows.forEach(row => {
                 const tableRow = new Array(numCols).fill('');
                 row.forEach(item => {
@@ -2332,9 +2387,16 @@
                         let score;
                         
                         if (col.isAmount && itemIsAmount) {
-                            // Amount column + amount item: use CENTER alignment 
-                            // (more reliable than right-edge for varied amount widths)
-                            score = Math.abs(itemCenter - colCenters[i]);
+                            // HYBRID matching for amount columns:
+                            // Try (1) detected actual right-edge, (2) header right-edge, (3) center
+                            // Pick whichever gives the smallest distance
+                            const detectedRight = detectedRightEdges[i];
+                            const rightScore = detectedRight !== undefined 
+                                ? Math.abs(itemRight - detectedRight)
+                                : Math.abs(itemRight - col.right);
+                            const headerRightScore = Math.abs(itemRight - col.right);
+                            const centerScore = Math.abs(itemCenter - colCenters[i]);
+                            score = Math.min(rightScore, headerRightScore, centerScore);
                         } else if (!col.isAmount && !itemIsAmount) {
                             // Text column + text item: use LEFT edge alignment
                             score = Math.abs(itemLeft - col.x);
